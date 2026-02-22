@@ -1,205 +1,286 @@
-import cv2
+import ctypes
 import threading
+import cv2
+import objc
+import Quartz
+from PyQt6.QtWidgets import QWidget, QApplication
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QPainter, QPen, QColor, QFont
 from hand_display import HandDisplay
 from card_renderer import CARD_H
-from config import SUIT_BGR, OCR_INTERVAL_FRAMES
+from config import OCR_INTERVAL_FRAMES, SHOW_TURN_BANNER_ALWAYS
 from turn_detector import is_my_turn
 
-# Layout: card strip top and height (match hand_display)
-CARD_STRIP_TOP = 20
-CARD_STRIP_H = CARD_H
-LEGEND_PAD = 8
-LEGEND_FONT = cv2.FONT_HERSHEY_SIMPLEX
-LEGEND_SCALE = 0.5
-LEGEND_THICK = 1
 
-
-def _draw_my_turn_overlay(frame):
-    """Draw 'YOUR TURN!' banner in a row below the card strip so it never overlaps cards."""
-    h, w = frame.shape[:2]
-    bar_h = 44
-    bar_w = min(280, w - 40)
-    y1 = CARD_STRIP_TOP + CARD_STRIP_H + 10
-    y2 = y1 + bar_h
-    x1 = (w - bar_w) // 2
-    x2 = x1 + bar_w
-    if y2 > h - 5:
-        return
-    overlay = frame[y1:y2, x1:x2].copy()
-    yellow = (0, 220, 255)
-    cv2.rectangle(overlay, (0, 0), (bar_w, bar_h), yellow, -1)
-    cv2.addWeighted(overlay, 0.55, frame[y1:y2, x1:x2], 0.45, 0, frame[y1:y2, x1:x2])
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-    text = "YOUR TURN!"
-    (tw, th), _ = cv2.getTextSize(text, LEGEND_FONT, 0.9, 2)
-    tx = x1 + (bar_w - tw) // 2
-    ty = y1 + (bar_h + th) // 2
-    cv2.putText(frame, text, (tx, ty), LEGEND_FONT, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
-
-
-def _draw_legend(frame):
-    """Draw instructions for regions and keys (top-left, below card strip, so always visible)."""
-    h, w = frame.shape[:2]
-    lines = [
-        "Yellow = hand region | Magenta = Your turn! box",
-        "r = re-draw hand | o = re-draw OCR box | q = quit",
-    ]
-    max_w = 0
-    line_heights = []
-    for line in lines:
-        (lw, lh), _ = cv2.getTextSize(line, LEGEND_FONT, LEGEND_SCALE, LEGEND_THICK)
-        line_heights.append(lh)
-        max_w = max(max_w, lw)
-    line_h = max(line_heights) + 4
-    panel_h = len(lines) * line_h + LEGEND_PAD * 2
-    panel_w = max_w + LEGEND_PAD * 2
-    # Place below card strip, top-left of that row
-    py1 = CARD_STRIP_TOP + CARD_STRIP_H + 10
-    px1 = LEGEND_PAD
-    px2, py2 = px1 + panel_w, py1 + panel_h
-    if py2 > h or px2 > w:
-        return
-    overlay = frame[py1:py2, px1:px2].copy()
-    cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (40, 40, 40), -1)
-    cv2.addWeighted(overlay, 0.85, frame[py1:py2, px1:px2], 0.15, 0, frame[py1:py2, px1:px2])
-    cv2.rectangle(frame, (px1, py1), (px2, py2), (120, 120, 120), 1)
-    for i, line in enumerate(lines):
-        y = py1 + LEGEND_PAD + (i + 1) * line_h - 4
-        cv2.putText(frame, line, (px1 + LEGEND_PAD, y), LEGEND_FONT, LEGEND_SCALE, (220, 220, 220), LEGEND_THICK, cv2.LINE_AA)
-
+# --- Region selection (cv2, runs before overlay exists) ---
 
 def select_hand_region(vision_engine):
-    """Capture a frame and let the user draw a rectangle around their hand."""
     print("[SELECT] Draw a rectangle around your hand, then press ENTER or SPACE.")
     frame = vision_engine.capture_screen()
     h, w = frame.shape[:2]
     display = cv2.resize(frame, (w // 2, h // 2))
-
     roi = cv2.selectROI("Select Your Hand Region", display, showCrosshair=False)
     cv2.destroyWindow("Select Your Hand Region")
-
-    # roi = (x, y, w, h) in half-res coords — scale back to full res
     rx, ry, rw, rh = roi
     x1, y1 = rx * 2, ry * 2
     x2, y2 = (rx + rw) * 2, (ry + rh) * 2
-
-    print(f"[SELECT] Hand region set: ({x1}, {y1}) → ({x2}, {y2})")
+    print(f"[SELECT] Hand region set: ({x1}, {y1}) -> ({x2}, {y2})")
     return (x1, y1, x2, y2)
 
 
 def select_ocr_region(vision_engine):
-    """Capture a frame and let the user draw a rectangle around the 'Your turn!' area."""
     print("[SELECT] Draw a box around the 'Your turn!' text, then press ENTER or SPACE.")
     frame = vision_engine.capture_screen()
     h, w = frame.shape[:2]
     display = cv2.resize(frame, (w // 2, h // 2))
-
     roi = cv2.selectROI("Select 'Your turn!' region (OCR)", display, showCrosshair=False)
     cv2.destroyWindow("Select 'Your turn!' region (OCR)")
-
     rx, ry, rw, rh = roi
     x1, y1 = rx * 2, ry * 2
     x2, y2 = (rx + rw) * 2, (ry + rh) * 2
-
-    print(f"[SELECT] OCR region set: ({x1}, {y1}) → ({x2}, {y2})")
+    print(f"[SELECT] OCR region set: ({x1}, {y1}) -> ({x2}, {y2})")
     return (x1, y1, x2, y2)
 
 
-def run_detection_loop(vision_engine, hand_region, ocr_region):
-    """Detect cards only within the hand region. Inference runs in background thread."""
-    print("[DEBUG] Detection running — 'q' quit | 'r' re-select hand | 'o' re-select OCR box.")
+# --- PyQt6 Overlay ---
 
-    x1, y1, x2, y2 = hand_region
-    ox1, oy1, ox2, oy2 = ocr_region
-    prev_labels = []
-    hand_display = HandDisplay()
+CARD_STRIP_TOP = 20
+CARD_STRIP_H = CARD_H
 
-    # OCR "Your turn!" state — run every N frames, smooth display
-    frame_count = 0
-    my_turn = False
 
-    # Shared state between display loop and inference thread
-    lock = threading.Lock()
-    latest_boxes = []
-    inferring = False
+class ScreenOverlay(QWidget):
+    def __init__(self, vision_engine, hand_region, ocr_region):
+        super().__init__()
+        self.vision = vision_engine
+        self.hand_region = hand_region
+        self.ocr_region = ocr_region
 
-    def run_inference(hand_crop):
-        nonlocal latest_boxes, inferring
-        boxes = vision_engine.detect_cards(hand_crop)
-        with lock:
-            latest_boxes = boxes
-            inferring = False
+        self.hand_display = HandDisplay()
+        self.prev_labels = []
 
-    while True:
-        frame = vision_engine.capture_screen()
+        # Detection state (shared with inference thread)
+        self._lock = threading.Lock()
+        self._latest_boxes = []
+        self._inferring = False
 
-        # Kick off inference in background if not already running
-        if not inferring:
+        # OCR state
+        self._frame_count = 0
+        self._my_turn = False
+        self._last_frame = None
+
+        # Hotkey state
+        self._pending_action = None
+        self._tap = None
+
+        # Window setup: transparent, click-through, always-on-top
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setStyleSheet("background: transparent;")
+
+        # Size to full screen
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.show()
+
+        print(f"[DEBUG] Overlay geometry: {self.geometry().width()}x{self.geometry().height()}")
+        print(f"[DEBUG] DPI ratio: {self.devicePixelRatioF()}")
+        print(f"[DEBUG] WA_TranslucentBackground: {self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)}")
+
+        # Get CGWindowID and pass to vision engine
+        self._setup_window_exclusion()
+
+        # Global hotkey listener
+        self._start_hotkey_listener()
+
+        # Timer drives the loop
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._update_screen)
+        self._timer.start(30)
+
+        print("[DEBUG] Overlay started — r=re-draw hand, o=re-draw OCR, q=quit")
+
+    def _setup_window_exclusion(self):
+        """Get this window's CGWindowID, configure always-on-top, exclude from capture."""
+        try:
+            win_id = int(self.winId())
+            ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(win_id))
+            ns_window = ns_view.window()
+            window_number = ns_window.windowNumber()
+            self.vision.set_exclude_window(window_number)
+
+            # Force transparency
+            ns_window.setOpaque_(False)
+            ns_window.setBackgroundColor_(
+                objc.lookUpClass("NSColor").clearColor()
+            )
+
+            # Force always-on-top above ALL windows (including fullscreen apps)
+            ns_window.setLevel_(1000)
+            ns_window.setCollectionBehavior_(
+                (1 << 0)   # NSWindowCollectionBehaviorCanJoinAllSpaces
+                | (1 << 8) # NSWindowCollectionBehaviorStationary
+            )
+            # Prevent hiding when user clicks another app
+            ns_window.setHidesOnDeactivate_(False)
+            ns_window.setCanHide_(False)
+            print(f"[DEBUG] Window: level=1000, hidesOnDeactivate=False")
+        except Exception as e:
+            print(f"[WARN] Could not configure NSWindow: {e}")
+
+    def _start_hotkey_listener(self):
+        """Listen for global keypresses (r, o, q) via Quartz event tap."""
+        def callback(proxy, event_type, event, refcon):
+            if event_type == Quartz.kCGEventKeyDown:
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                # r=15, o=31, q=12 on macOS
+                if keycode == 15:  # r
+                    self._pending_action = "hand"
+                elif keycode == 31:  # o
+                    self._pending_action = "ocr"
+                elif keycode == 12:  # q
+                    self._pending_action = "quit"
+            return event
+
+        mask = Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+        self._tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionListenOnly,
+            mask,
+            callback,
+            None,
+        )
+        if self._tap:
+            source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
+            Quartz.CFRunLoopAddSource(
+                Quartz.CFRunLoopGetMain(), source, Quartz.kCFRunLoopCommonModes
+            )
+            print("[DEBUG] Global hotkeys active: r=hand, o=OCR, q=quit")
+        else:
+            print("[WARN] Could not create event tap — run with Accessibility permissions")
+
+    def _run_inference(self, hand_crop):
+        boxes = self.vision.detect_cards(hand_crop)
+        with self._lock:
+            self._latest_boxes = boxes
+            self._inferring = False
+
+    def _update_screen(self):
+        # Handle pending hotkey actions
+        if self._pending_action == "hand":
+            self._pending_action = None
+            self._timer.stop()
+            self.hide()
+            self.hand_region = select_hand_region(self.vision)
+            self.prev_labels = []
+            self.show()
+            self._timer.start(30)
+            return
+        elif self._pending_action == "ocr":
+            self._pending_action = None
+            self._timer.stop()
+            self.hide()
+            self.ocr_region = select_ocr_region(self.vision)
+            self.show()
+            self._timer.start(30)
+            return
+        elif self._pending_action == "quit":
+            self._pending_action = None
+            QApplication.quit()
+            return
+
+        frame = self.vision.capture_screen()
+        self._last_frame = frame
+
+        x1, y1, x2, y2 = self.hand_region
+
+        if not self._inferring:
             hand = frame[y1:y2, x1:x2].copy()
-            inferring = True
-            threading.Thread(target=run_inference, args=(hand,), daemon=True).start()
+            self._inferring = True
+            threading.Thread(target=self._run_inference, args=(hand,), daemon=True).start()
 
-        # Use latest available results (may be from previous frame)
-        with lock:
-            boxes = latest_boxes
+        with self._lock:
+            boxes = self._latest_boxes
 
-        cur_labels = []
         raw_labels = []
-
         for box in boxes:
-            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-            conf = float(box.conf[0])
-            label = vision_engine.card_model.names[int(box.cls[0])]
-            cur_labels.append(f"{label} {int(conf * 100)}%")
+            label = self.vision.card_model.names[int(box.cls[0])]
             raw_labels.append(label)
 
-            # Color by suit
-            suit = label[-1]
-            color = SUIT_BGR.get(suit, (128, 128, 128))
+        self.hand_display.update(raw_labels)
 
-            cv2.rectangle(frame, (x1 + bx1, y1 + by1), (x1 + bx2, y1 + by2), color, 2)
-            cv2.putText(frame, f"{label} {int(conf * 100)}%",
-                        (x1 + bx1, y1 + by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+        self._frame_count += 1
+        if self._frame_count >= OCR_INTERVAL_FRAMES:
+            self._frame_count = 0
+            ox1, oy1, ox2, oy2 = self.ocr_region
+            prev_turn = self._my_turn
+            self._my_turn = is_my_turn(frame, roi_xyxy=(ox1, oy1, ox2, oy2))
+            if self._my_turn and not prev_turn:
+                print("[OCR] Your turn detected — showing banner")
 
-        # Hand region outline (yellow); OCR region outline (magenta)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 1)
-        cv2.rectangle(frame, (ox1, oy1), (ox2, oy2), (255, 0, 255), 1)
-
-        # Animated card overlay at top
-        hand_display.draw_hand(frame, raw_labels)
-
-        # OCR: detect "Your turn!" every N frames (use drawn box)
-        frame_count += 1
-        if frame_count >= OCR_INTERVAL_FRAMES:
-            frame_count = 0
-            my_turn = is_my_turn(frame, roi_xyxy=(ox1, oy1, ox2, oy2))
-        if my_turn:
-            _draw_my_turn_overlay(frame)
-
-        _draw_legend(frame)
-
-        # Print when hand changes
-        if sorted(cur_labels) != sorted(prev_labels):
+        cur_labels = [f"{self.vision.card_model.names[int(b.cls[0])]} {int(float(b.conf[0]) * 100)}%" for b in boxes]
+        if sorted(cur_labels) != sorted(self.prev_labels):
             if cur_labels:
                 print(f"[MY HAND] {', '.join(cur_labels)}")
-            prev_labels = cur_labels
+            self.prev_labels = cur_labels
 
-        # Display
-        h, w = frame.shape[:2]
-        display = cv2.resize(frame, (w // 2, h // 2))
-        cv2.imshow("Card Detection", display)
+        self.update()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('r'):
-            cv2.destroyAllWindows()
-            hand_region = select_hand_region(vision_engine)
-            x1, y1, x2, y2 = hand_region
-            prev_labels = []
-        elif key == ord('o'):
-            cv2.destroyAllWindows()
-            ocr_region = select_ocr_region(vision_engine)
-            ox1, oy1, ox2, oy2 = ocr_region
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    cv2.destroyAllWindows()
+        scale = self.devicePixelRatioF()
+
+        # --- Hand region outline (yellow) ---
+        x1, y1, x2, y2 = self.hand_region
+        painter.setPen(QPen(QColor(255, 255, 0), 1))
+        painter.drawRect(
+            int(x1 / scale), int(y1 / scale),
+            int((x2 - x1) / scale), int((y2 - y1) / scale),
+        )
+
+        # --- OCR region outline (magenta) ---
+        ox1, oy1, ox2, oy2 = self.ocr_region
+        painter.setPen(QPen(QColor(255, 0, 255), 1))
+        painter.drawRect(
+            int(ox1 / scale), int(oy1 / scale),
+            int((ox2 - ox1) / scale), int((oy2 - oy1) / scale),
+        )
+
+        # --- Card hand strip at top (and YOUR TURN! in same overlay strip) ---
+        screen_w = int(self.width())
+        self.hand_display.paint(painter, screen_w)
+
+        # YOUR TURN! banner: use same scale as outlines so it appears in correct place on HiDPI
+        if self._my_turn or SHOW_TURN_BANNER_ALWAYS:
+            self._paint_turn_banner(painter, screen_w)
+
+        painter.end()
+
+    def _paint_turn_banner(self, painter, screen_w):
+        bar_w = min(220, screen_w - 40)
+        bar_h = CARD_STRIP_H + 4
+        by1 = CARD_STRIP_TOP - 2
+        bx1 = screen_w - bar_w - 24
+
+        painter.save()
+        painter.setOpacity(1.0)
+        painter.fillRect(bx1, by1, bar_w, bar_h, QColor(0, 220, 255))
+        painter.restore()
+
+        painter.setPen(QPen(QColor(0, 255, 255), 2))
+        painter.drawRect(bx1, by1, bar_w, bar_h)
+
+        painter.setPen(QColor(0, 0, 0))
+        painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        painter.drawText(bx1, by1, bar_w, bar_h, Qt.AlignmentFlag.AlignCenter, "YOUR TURN!")

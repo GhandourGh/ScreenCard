@@ -1,6 +1,6 @@
-import cv2
-import numpy as np
-from card_renderer import render_card, CARD_W, CARD_H
+from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt
+from card_renderer import render_card_pixmap, CARD_W, CARD_H
 from config import CARD_VALUES, CARD_STICKY_FRAMES
 
 FADE_SPEED = 0.15
@@ -19,20 +19,18 @@ def _sort_key(label):
 class HandDisplay:
     def __init__(self):
         self.card_opacities = {}
-        self.card_miss_count = {}  # frames a card was not detected (for sticky removal)
+        self.card_miss_count = {}
 
-    def draw_hand(self, frame, detected_labels):
-        """Update opacities and composite card row at top-center of frame."""
+    def update(self, detected_labels):
+        """Update fade state. Call from main thread before paint."""
         detected_set = set(detected_labels)
 
-        # Fade in detected cards; reset miss count when seen
         for label in detected_set:
             if label not in self.card_opacities:
                 self.card_opacities[label] = 0.0
             self.card_opacities[label] = min(1.0, self.card_opacities[label] + FADE_SPEED)
             self.card_miss_count[label] = 0
 
-        # Only fade out / remove after card has been missed for STICKY_FRAMES (reduces flicker, keeps briefly missed cards)
         to_remove = []
         for label in self.card_opacities:
             if label not in detected_set:
@@ -46,43 +44,34 @@ class HandDisplay:
             del self.card_opacities[label]
             self.card_miss_count.pop(label, None)
 
+    def paint(self, painter, frame_width):
+        """Draw card strip at top-center using QPainter. Call inside paintEvent."""
         if not self.card_opacities:
             return
 
-        # Sort by suit then rank
         sorted_labels = sorted(self.card_opacities.keys(), key=_sort_key)
-
-        # Calculate row position (centered horizontally)
         total_w = len(sorted_labels) * CARD_W + (len(sorted_labels) - 1) * CARD_GAP
-        frame_h, frame_w = frame.shape[:2]
-        start_x = max(0, (frame_w - total_w) // 2)
+        start_x = max(0, (frame_width - total_w) // 2)
         y = TOP_MARGIN
 
-        # Draw semi-transparent dark background bar
+        # Dark background bar
         bar_pad = 10
-        bar_x1 = max(0, start_x - bar_pad)
-        bar_y1 = max(0, y - bar_pad)
-        bar_x2 = min(frame_w, start_x + total_w + bar_pad)
-        bar_y2 = min(frame_h, y + CARD_H + bar_pad)
+        painter.save()
+        painter.setOpacity(0.7)
+        painter.fillRect(
+            start_x - bar_pad, y - bar_pad,
+            total_w + bar_pad * 2, CARD_H + bar_pad * 2,
+            QColor(20, 20, 30),
+        )
+        painter.restore()
 
-        overlay = frame[bar_y1:bar_y2, bar_x1:bar_x2].copy()
-        dark = np.zeros_like(overlay)
-        cv2.addWeighted(overlay, 0.35, dark, 0.65, 0, overlay)
-        frame[bar_y1:bar_y2, bar_x1:bar_x2] = overlay
-
-        # Composite each card
+        # Draw each card with its opacity
         for i, label in enumerate(sorted_labels):
             opacity = self.card_opacities[label]
-            card_img = render_card(label)  # BGRA
+            pixmap = render_card_pixmap(label)
             cx = start_x + i * (CARD_W + CARD_GAP)
 
-            if cx < 0 or cx + CARD_W > frame_w or y + CARD_H > frame_h:
-                continue
-
-            bgr = card_img[:, :, :3]
-            alpha = (card_img[:, :, 3].astype(np.float32) / 255.0) * opacity
-
-            roi = frame[y:y + CARD_H, cx:cx + CARD_W]
-            for c in range(3):
-                roi[:, :, c] = (alpha * bgr[:, :, c] + (1.0 - alpha) * roi[:, :, c]).astype(np.uint8)
-            frame[y:y + CARD_H, cx:cx + CARD_W] = roi
+            painter.save()
+            painter.setOpacity(opacity)
+            painter.drawPixmap(cx, y, pixmap)
+            painter.restore()

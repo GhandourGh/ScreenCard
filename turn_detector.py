@@ -35,4 +35,5 @@ def is_my_turn(frame, roi_xyxy=None):
     reader = _get_reader()
     results = reader.readtext(roi)
     combined = " ".join([t[1] for t in results]).lower()
-    return "your turn" in combined
+    # Match "your turn", "your turn to lead", "turn to lead", etc.
+    return "your turn" in combined or "turn to lead" in combined or "turn to play" in combined

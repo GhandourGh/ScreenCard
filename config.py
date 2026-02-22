@@ -2,7 +2,7 @@
 import os
 
 # Detection: lower conf = more cards found (more false positives); higher = stricter
-CONFIDENCE_THRESHOLD = 0.15
+CONFIDENCE_THRESHOLD = 0.30
 CARD_MODEL_PATH = "models/playingCards.pt"
 # Larger size can help small/distant cards but is slower (e.g. 640, 896, 1024)
 INFERENCE_SIZE = 640
@@ -30,5 +30,7 @@ CARD_VALUES = {
 
 # OCR "Your turn!" detection — ROI as fraction of frame (x, y, width, height), top-left region
 OCR_ROI = (0.0, 0.0, 0.28, 0.12)
-# Run OCR every N frames to reduce CPU
-OCR_INTERVAL_FRAMES = 12
+# Run OCR every N frames to reduce CPU (lower = banner updates faster)
+OCR_INTERVAL_FRAMES = 4
+# Set True to always show "YOUR TURN!" banner (for testing alignment/visibility)
+SHOW_TURN_BANNER_ALWAYS = False
