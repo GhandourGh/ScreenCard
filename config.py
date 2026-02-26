@@ -1,36 +1,51 @@
-# config.py
-import os
-
-# Detection: lower conf = more cards found (more false positives); higher = stricter
-CONFIDENCE_THRESHOLD = 0.30
+# ── Detection ────────────────────────────────────────────────────
 CARD_MODEL_PATH = "models/playingCards.pt"
-# Larger size can help small/distant cards but is slower (e.g. 640, 896, 1024)
-INFERENCE_SIZE = 640
-# NMS: lower iou = keep more overlapping boxes (helps fanned cards); default ~0.7
-IOU_NMS_THRESHOLD = 0.5
-# How many frames a card can be "missed" before we remove it from the overlay (reduces flicker)
-CARD_STICKY_FRAMES = 20
+CONFIDENCE_THRESHOLD = 0.08
+INFERENCE_SIZE = 960
+IOU_NMS_THRESHOLD = 0.72
+CARD_STICKY_FRAMES = 24
+OVERLAY_REFRESH_MS = 16
 
-# Card screenshot folder (e.g. CardCV "cards copy" with 10_of_clubs.png, ace_of_hearts.png, ...)
+# ── Preprocessing ────────────────────────────────────────────────
+PREPROCESS_CLAHE = True
+PREPROCESS_SHARPEN = True
+ROI_PAD_FRACTION = 0.12
+SMART_HAND_CROP = False
+SMART_HAND_MIN_AREA_FRAC = 0.004
+SMART_HAND_V_MIN = 125
+SMART_HAND_S_MAX = 95
+SMART_HAND_PAD = 10
+
+# Upscale small hand crops before YOLO to improve small-card recall.
+DETECTION_UPSCALE_ENABLED = True
+DETECTION_UPSCALE_MIN_HEIGHT = 520
+DETECTION_UPSCALE_MAX_FACTOR = 2.5
+
+# ── Runtime post-processing (no retraining required) ─────────────
+# Keep only card-corner-like boxes inside the hand crop.
+MIN_BOX_WIDTH_FRAC = 0.012
+MIN_BOX_HEIGHT_FRAC = 0.04
+MAX_BOX_WIDTH_FRAC = 0.98
+MAX_BOX_HEIGHT_FRAC = 1.00
+
+# Stabilize the displayed hand across recent frames.
+CONSENSUS_WINDOW = 10
+CONSENSUS_MIN_HITS = 1
+CONSENSUS_MIN_CONF = 0.08
+
+# ── Tiling (for wide hand crops) ────────────────────────────────
+TILE_ASPECT_THRESHOLD = 2.0
+TILE_ASPECT_TARGET = 1.3
+TILE_OVERLAP = 0.65
+
+# ── Card assets ──────────────────────────────────────────────────
 CARDS_DIR = "/Users/macos/Desktop/CardCV/assets/cards copy"
-
-# BGR colors for suit boxes on overlay (no cardui)
-SUIT_BGR = {
-    "C": (80, 125, 46),   # clubs - green
-    "S": (192, 101, 21),  # spades - blue
-    "H": (80, 80, 198),   # hearts - red
-    "D": (0, 101, 230),   # diamonds - orange
-}
-
 CARD_VALUES = {
     "A": 1, "2": 2, "3": 3, "4": 4, "5": 5,
     "6": 6, "7": 7, "8": 8, "9": 9, "10": 10,
     "J": 11, "Q": 12, "K": 13,
 }
 
-# OCR "Your turn!" detection — ROI as fraction of frame (x, y, width, height), top-left region
-OCR_ROI = (0.0, 0.0, 0.28, 0.12)
-# Run OCR every N frames to reduce CPU (lower = banner updates faster)
+# ── OCR ("Your turn!" detection) ────────────────────────────────
 OCR_INTERVAL_FRAMES = 4
-# Set True to always show "YOUR TURN!" banner (for testing alignment/visibility)
 SHOW_TURN_BANNER_ALWAYS = False
